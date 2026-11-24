@@ -1,0 +1,578 @@
+name: Build IPA Signer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+
+env:
+  # Change this to a bundle id that matches YOUR provisioning profile
+  BUNDLE_ID: com.ipasigner.app
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Fetch Zsign package
+        run: git clone --depth 1 --recurse-submodules https://github.com/khcrysalis/Zsign-Package.git Zsign-Package
+
+      - name: Dump Zsign API (send me this part of the log if the build fails)
+        run: |
+          echo "===== Package.swift ====="
+          cat Zsign-Package/Package.swift
+          echo "===== Files ====="
+          find Zsign-Package/Sources -maxdepth 3 \( -name "*.swift" -o -name "*.h" -o -name "*.hpp" -o -name "*.mm" \) | head -50
+          echo "===== Public API ====="
+          find Zsign-Package/Sources -maxdepth 3 \( -name "*.swift" -o -name "*.h" \) -exec sh -c 'echo "--- $1"; head -80 "$1"' _ {} \;
+
+      - name: Generate app sources
+        run: |
+          mkdir -p Sources Resources Config
+
+          cat > Sources/IPASignerApp.swift <<'EOF'
+          import SwiftUI
+
+          @main
+          struct IPASignerApp: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+          EOF
+
+          cat > Sources/Workspace.swift <<'EOF'
+          import Foundation
+
+          enum Workspace {
+              static let root: URL = make("signer")
+              static let inbox: URL = make("signer/inbox")
+              static let output: URL = make("signer/output")
+
+              private static func make(_ path: String) -> URL {
+                  let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                  let url = base.appendingPathComponent(path, isDirectory: true)
+                  try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                  return url
+              }
+          }
+          EOF
+
+          cat > Sources/FilePicker.swift <<'EOF'
+          import SwiftUI
+          import UniformTypeIdentifiers
+
+          // Uses .item so ipa / p12 / mobileprovision are never greyed out,
+          // and asCopy: true so the file is copied into the app sandbox
+          // (this is what fixes "files don't open").
+          struct FilePicker: UIViewControllerRepresentable {
+              var onPick: (URL) -> Void
+
+              func makeCoordinator() -> Coordinator { Coordinator(onPick) }
+
+              func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+                  let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+                  picker.allowsMultipleSelection = false
+                  picker.delegate = context.coordinator
+                  return picker
+              }
+
+              func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
+
+              final class Coordinator: NSObject, UIDocumentPickerDelegate {
+                  let onPick: (URL) -> Void
+                  init(_ onPick: @escaping (URL) -> Void) { self.onPick = onPick }
+
+                  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+                      guard let src = urls.first else { return }
+                      let access = src.startAccessingSecurityScopedResource()
+                      defer { if access { src.stopAccessingSecurityScopedResource() } }
+                      let dest = Workspace.inbox.appendingPathComponent(src.lastPathComponent)
+                      try? FileManager.default.removeItem(at: dest)
+                      do {
+                          try FileManager.default.copyItem(at: src, to: dest)
+                          onPick(dest)
+                      } catch {
+                          onPick(src)
+                      }
+                  }
+              }
+          }
+
+          struct ShareSheet: UIViewControllerRepresentable {
+              let items: [Any]
+              func makeUIViewController(context: Context) -> UIActivityViewController {
+                  UIActivityViewController(activityItems: items, applicationActivities: nil)
+              }
+              func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+          }
+          EOF
+
+          cat > Sources/Signer.swift <<'EOF'
+          import Foundation
+          import ZIPFoundation
+          import __ZSIGN_PRODUCT__
+
+          struct SignOptions {
+              var ipa: URL
+              var p12: URL
+              var password: String
+              var profile: URL
+              var name: String
+              var bundleID: String
+              var enableFileSharing: Bool
+          }
+
+          struct SignResult {
+              var ipa: URL
+              var bundleID: String
+              var name: String
+              var version: String
+          }
+
+          enum SignError: LocalizedError {
+              case msg(String)
+              var errorDescription: String? {
+                  switch self { case .msg(let m): return m }
+              }
+          }
+
+          enum Signer {
+              static func sign(_ o: SignOptions, log: @escaping (String) -> Void) async throws -> SignResult {
+                  let fm = FileManager.default
+                  let work = Workspace.root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                  try fm.createDirectory(at: work, withIntermediateDirectories: true)
+                  defer { try? fm.removeItem(at: work) }
+
+                  log("فك ضغط الـ IPA…")
+                  try fm.unzipItem(at: o.ipa, to: work)
+
+                  let payload = work.appendingPathComponent("Payload", isDirectory: true)
+                  guard let appName = try fm.contentsOfDirectory(atPath: payload.path).first(where: { $0.hasSuffix(".app") }) else {
+                      throw SignError.msg("ما لقيت ملف .app داخل Payload")
+                  }
+                  let app = payload.appendingPathComponent(appName, isDirectory: true)
+
+                  let plistURL = app.appendingPathComponent("Info.plist")
+                  guard var info = NSDictionary(contentsOf: plistURL) as? [String: Any] else {
+                      throw SignError.msg("تعذر قراءة Info.plist")
+                  }
+                  if !o.name.isEmpty {
+                      info["CFBundleDisplayName"] = o.name
+                      info["CFBundleName"] = o.name
+                  }
+                  if !o.bundleID.isEmpty {
+                      info["CFBundleIdentifier"] = o.bundleID
+                  }
+                  if o.enableFileSharing {
+                      info["UIFileSharingEnabled"] = true
+                      info["LSSupportsOpeningDocumentsInPlace"] = true
+                  }
+                  let plistData = try PropertyListSerialization.data(fromPropertyList: info, format: .binary, options: 0)
+                  try plistData.write(to: plistURL)
+
+                  log("التوقيع…")
+                  try await runZsign(app: app, o: o)
+
+                  log("ضغط الـ IPA الموقّع…")
+                  let shownName = (info["CFBundleDisplayName"] as? String)
+                      ?? (info["CFBundleName"] as? String)
+                      ?? appName.replacingOccurrences(of: ".app", with: "")
+                  let out = Workspace.output.appendingPathComponent("\(shownName)-signed.ipa")
+                  try? fm.removeItem(at: out)
+                  try fm.zipItem(at: payload, to: out, shouldKeepParent: true, compressionMethod: .deflate)
+
+                  return SignResult(
+                      ipa: out,
+                      bundleID: info["CFBundleIdentifier"] as? String ?? "",
+                      name: shownName,
+                      version: info["CFBundleShortVersionString"] as? String ?? "1.0"
+                  )
+              }
+
+              // ⚠️ THE ONE PLACE THAT MAY NEED ADJUSTING: this call follows my best guess of the
+              // package's API. If the build fails here, send me the "Dump Zsign API" part of the log.
+              private static func runZsign(app: URL, o: SignOptions) async throws {
+                  try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                      Zsign.sign(
+                          appPath: app.path,
+                          provisionPath: o.profile.path,
+                          p12Path: o.p12.path,
+                          p12Password: o.password,
+                          entitlementsPath: "",
+                          customIdentifier: "",
+                          customName: "",
+                          customVersion: "",
+                          adhoc: false,
+                          removeProvision: false
+                      ) { ok, error in
+                          if ok { cont.resume() }
+                          else { cont.resume(throwing: error ?? SignError.msg("فشل التوقيع")) }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > Sources/InstallServer.swift <<'EOF'
+          import Foundation
+          import Network
+          import Security
+          import AVFoundation
+
+          // Local HTTPS server + itms-services link = on-device install without a computer.
+          // Needs server.p12 (a public localhost certificate fetched during the build).
+          final class InstallServer {
+              static let shared = InstallServer()
+              static let host = "local.backloop.dev"   // resolves to 127.0.0.1
+              static let port: UInt16 = 4443
+
+              private var listener: NWListener?
+              private var ipaURL: URL?
+              private var manifest = Data()
+              private let queue = DispatchQueue(label: "install.server")
+
+              func start(ipa: URL, bundleID: String, name: String, version: String) throws -> URL {
+                  stop()
+                  guard let p12 = Bundle.main.url(forResource: "server", withExtension: "p12") else {
+                      throw SignError.msg("شهادة الـ HTTPS غير موجودة (فشل تنزيلها أثناء البناء). استخدم زر المشاركة بدلاً من التثبيت.")
+                  }
+                  let data = try Data(contentsOf: p12)
+                  var items: CFArray?
+                  let status = SecPKCS12Import(data as CFData, [kSecImportExportPassphrase as String: "signer"] as CFDictionary, &items)
+                  guard status == errSecSuccess,
+                        let arr = items as? [[String: Any]],
+                        let first = arr.first,
+                        let idRef = first[kSecImportItemIdentity as String] else {
+                      throw SignError.msg("تعذر قراءة شهادة السيرفر (\(status))")
+                  }
+                  let identity = idRef as! SecIdentity
+                  let tls = NWProtocolTLS.Options()
+                  sec_protocol_options_set_local_identity(tls.securityProtocolOptions, sec_identity_create(identity)!)
+                  let params = NWParameters(tls: tls)
+
+                  ipaURL = ipa
+                  let base = "https://\(Self.host):\(Self.port)"
+                  let safeName = name.replacingOccurrences(of: "&", with: "&amp;")
+                      .replacingOccurrences(of: "<", with: "&lt;")
+                      .replacingOccurrences(of: ">", with: "&gt;")
+                  let xml = """
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>items</key><array><dict>
+          <key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>\(base)/app.ipa</string></dict></array>
+          <key>metadata</key><dict><key>bundle-identifier</key><string>\(bundleID)</string><key>bundle-version</key><string>\(version)</string><key>kind</key><string>software</string><key>title</key><string>\(safeName)</string></dict>
+          </dict></array></dict></plist>
+          """
+                  manifest = Data(xml.utf8)
+
+                  let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.port)!)
+                  l.newConnectionHandler = { [weak self] c in self?.handle(c) }
+                  l.start(queue: queue)
+                  listener = l
+
+                  let manifestURL = "\(base)/manifest.plist"
+                  guard let url = URL(string: "itms-services://?action=download-manifest&url=\(manifestURL)") else {
+                      throw SignError.msg("رابط التثبيت غير صالح")
+                  }
+                  return url
+              }
+
+              func stop() {
+                  listener?.cancel()
+                  listener = nil
+              }
+
+              private func handle(_ c: NWConnection) {
+                  c.start(queue: queue)
+                  c.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, _ in
+                      guard let self = self, let data = data, let req = String(data: data, encoding: .utf8) else {
+                          c.cancel(); return
+                      }
+                      let path = req.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
+                      switch path {
+                      case "/manifest.plist":
+                          self.sendBody(self.manifest, type: "text/xml", on: c)
+                      case "/app.ipa":
+                          if let u = self.ipaURL { self.stream(u, on: c) }
+                          else { self.sendBody(Data(), status: "404 Not Found", on: c) }
+                      default:
+                          self.sendBody(Data(), status: "404 Not Found", on: c)
+                      }
+                  }
+              }
+
+              private func sendBody(_ body: Data, type: String = "text/plain", status: String = "200 OK", on c: NWConnection) {
+                  var out = Data("HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+                  out.append(body)
+                  c.send(content: out, completion: .contentProcessed { _ in c.cancel() })
+              }
+
+              private func stream(_ url: URL, on c: NWConnection) {
+                  guard let fh = try? FileHandle(forReadingFrom: url),
+                        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                        let size = (attrs[.size] as? NSNumber)?.intValue else {
+                      sendBody(Data(), status: "404 Not Found", on: c); return
+                  }
+                  let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: \(size)\r\nConnection: close\r\n\r\n"
+                  c.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] _ in
+                      self?.pump(fh, c)
+                  })
+              }
+
+              private func pump(_ fh: FileHandle, _ c: NWConnection) {
+                  let chunk = fh.readData(ofLength: 512 * 1024)
+                  if chunk.isEmpty { try? fh.close(); c.cancel(); return }
+                  c.send(content: chunk, completion: .contentProcessed { [weak self] err in
+                      if err != nil { try? fh.close(); c.cancel() }
+                      else { self?.pump(fh, c) }
+                  })
+              }
+          }
+
+          // Plays inaudible audio so iOS keeps the server alive while the system installer downloads the IPA.
+          final class KeepAlive {
+              static let shared = KeepAlive()
+              private var player: AVAudioPlayer?
+
+              func start() {
+                  try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
+                  try? AVAudioSession.sharedInstance().setActive(true)
+                  player = try? AVAudioPlayer(data: Self.silentWAV())
+                  player?.numberOfLoops = -1
+                  player?.play()
+              }
+
+              func stop() { player?.stop(); player = nil }
+
+              private static func silentWAV() -> Data {
+                  let sampleRate: UInt32 = 8000
+                  let dataSize: UInt32 = sampleRate * 2
+                  var d = Data()
+                  func u32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+                  func u16(_ v: UInt16) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+                  d.append(Data("RIFF".utf8)); u32(36 + dataSize); d.append(Data("WAVE".utf8))
+                  d.append(Data("fmt ".utf8)); u32(16); u16(1); u16(1); u32(sampleRate); u32(sampleRate * 2); u16(2); u16(16)
+                  d.append(Data("data".utf8)); u32(dataSize); d.append(Data(count: Int(dataSize)))
+                  return d
+              }
+          }
+          EOF
+
+          cat > Sources/ContentView.swift <<'EOF'
+          import SwiftUI
+
+          enum PickerKind: String, Identifiable {
+              case ipa, p12, profile
+              var id: String { rawValue }
+          }
+
+          struct ContentView: View {
+              @State private var ipa: URL?
+              @State private var p12: URL?
+              @State private var profile: URL?
+              @State private var password = ""
+              @State private var appName = ""
+              @State private var bundleID = ""
+              @State private var fileSharing = true
+              @State private var logText = ""
+              @State private var busy = false
+              @State private var result: SignResult?
+              @State private var picking: PickerKind?
+              @State private var showShare = false
+
+              var body: some View {
+                  NavigationView {
+                      Form {
+                          Section(header: Text("الملفات")) {
+                              row("ملف IPA", ipa, .ipa)
+                              row("الشهادة (.p12)", p12, .p12)
+                              row("البروفايل (.mobileprovision)", profile, .profile)
+                              SecureField("كلمة سر الشهادة", text: $password)
+                          }
+                          Section(header: Text("خيارات (اختياري)")) {
+                              TextField("اسم التطبيق الجديد", text: $appName)
+                              TextField("Bundle ID جديد", text: $bundleID)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                              Toggle("تفعيل مشاركة الملفات (تطبيق الملفات)", isOn: $fileSharing)
+                          }
+                          Section {
+                              Button(action: sign) {
+                                  HStack {
+                                      if busy { ProgressView() }
+                                      Text(busy ? "جارٍ التوقيع…" : "وقّع التطبيق")
+                                  }
+                              }
+                              .disabled(busy || ipa == nil || p12 == nil || profile == nil)
+                          }
+                          if let r = result {
+                              Section(header: Text("النتيجة: \(r.name)")) {
+                                  Button("تثبيت الآن") { install(r) }
+                                  Button("مشاركة / فتح في تطبيق آخر") { showShare = true }
+                              }
+                          }
+                          if !logText.isEmpty {
+                              Section(header: Text("السجل")) {
+                                  Text(logText)
+                                      .font(.system(.footnote, design: .monospaced))
+                                      .textSelection(.enabled)
+                              }
+                          }
+                      }
+                      .navigationTitle("IPA Signer")
+                  }
+                  .navigationViewStyle(.stack)
+                  .sheet(item: $picking) { kind in
+                      FilePicker { url in
+                          switch kind {
+                          case .ipa: ipa = url
+                          case .p12: p12 = url
+                          case .profile: profile = url
+                          }
+                          picking = nil
+                      }
+                  }
+                  .sheet(isPresented: $showShare) {
+                      if let r = result { ShareSheet(items: [r.ipa]) }
+                  }
+              }
+
+              private func row(_ title: String, _ url: URL?, _ kind: PickerKind) -> some View {
+                  Button { picking = kind } label: {
+                      HStack {
+                          Text(title)
+                          Spacer()
+                          Text(url?.lastPathComponent ?? "اختر ملف")
+                              .foregroundColor(.secondary)
+                              .lineLimit(1)
+                      }
+                  }
+              }
+
+              private func sign() {
+                  guard let ipa = ipa, let p12 = p12, let profile = profile else { return }
+                  busy = true
+                  result = nil
+                  logText = ""
+                  let opts = SignOptions(ipa: ipa, p12: p12, password: password, profile: profile,
+                                         name: appName, bundleID: bundleID, enableFileSharing: fileSharing)
+                  Task {
+                      do {
+                          let r = try await Signer.sign(opts) { msg in
+                              DispatchQueue.main.async { logText += msg + "\n" }
+                          }
+                          await MainActor.run {
+                              result = r
+                              busy = false
+                              logText += "✅ تم التوقيع\n"
+                          }
+                      } catch {
+                          await MainActor.run {
+                              logText += "❌ \(error.localizedDescription)\n"
+                              busy = false
+                          }
+                      }
+                  }
+              }
+
+              private func install(_ r: SignResult) {
+                  do {
+                      let url = try InstallServer.shared.start(ipa: r.ipa, bundleID: r.bundleID, name: r.name, version: r.version)
+                      KeepAlive.shared.start()
+                      logText += "فتح نافذة التثبيت… اضغط «تثبيت» ثم اترك IPA Signer شغّال حتى ينتهي التنزيل\n"
+                      UIApplication.shared.open(url)
+                  } catch {
+                      logText += "❌ \(error.localizedDescription)\n"
+                  }
+              }
+          }
+          EOF
+
+      - name: Fetch public localhost HTTPS certificate (optional, for on-device install)
+        continue-on-error: true
+        run: |
+          mkdir -p certs && cd certs
+          curl -fsSL https://backloop.dev/pack.tar.gz -o pack.tar.gz
+          tar xzf pack.tar.gz
+          find . -type f
+          CRT=$(find . -type f \( -name '*cert*' -o -name '*.crt' \) ! -name '*.tar.gz' | head -1)
+          KEY=$(find . -type f \( -name '*key*' \) ! -name '*.tar.gz' | head -1)
+          echo "CRT=$CRT KEY=$KEY"
+          openssl pkcs12 -export -inkey "$KEY" -in "$CRT" -out ../Resources/server.p12 -passout pass:signer
+          ls -la ../Resources
+
+      - name: Generate Xcode project
+        run: |
+          cat > project.yml <<'EOF'
+          name: IPASigner
+          options:
+            deploymentTarget:
+              iOS: "15.0"
+          packages:
+            Zsign:
+              path: Zsign-Package
+            ZIPFoundation:
+              url: https://github.com/weichsel/ZIPFoundation
+              from: 0.9.19
+          targets:
+            IPASigner:
+              type: application
+              platform: iOS
+              sources:
+                - Sources
+                - Resources
+              dependencies:
+                - package: Zsign
+                  product: __ZSIGN_PRODUCT__
+                - package: ZIPFoundation
+              info:
+                path: Config/Info.plist
+                properties:
+                  CFBundleDisplayName: IPA Signer
+                  CFBundleShortVersionString: "1.0"
+                  CFBundleVersion: "1"
+                  UILaunchScreen: {}
+                  UIFileSharingEnabled: true
+                  LSSupportsOpeningDocumentsInPlace: true
+                  UIBackgroundModes: [audio]
+                  ITSAppUsesNonExemptEncryption: false
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: __BUNDLE_ID__
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+          EOF
+
+          # Detect the library product name from the package manifest
+          PRODUCT=$(perl -0ne 'print $1 if /\.library\(\s*name:\s*"([^"]+)"/s' Zsign-Package/Package.swift)
+          echo "Detected Zsign product: $PRODUCT"
+          [ -n "$PRODUCT" ] || PRODUCT=Zsign
+          perl -pi -e "s/__ZSIGN_PRODUCT__/$PRODUCT/g" project.yml Sources/Signer.swift
+          perl -pi -e "s/__BUNDLE_ID__/$BUNDLE_ID/g" project.yml
+          xcodegen generate
+
+      - name: Build
+        run: |
+          xcodebuild -project IPASigner.xcodeproj -scheme IPASigner \
+            -configuration Release -sdk iphoneos \
+            -derivedDataPath build -clonedSourcePackagesDirPath SourcePackages \
+            -skipPackagePluginValidation -skipMacroValidation -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/IPASigner.app Payload/
+          zip -qr IPASigner.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPASigner
+          path: IPASigner.ipa
