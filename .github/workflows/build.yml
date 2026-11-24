@@ -20,7 +20,8 @@ jobs:
         run: brew install xcodegen
 
       - name: Fetch Zsign package
-        run: git clone --depth 1 --recurse-submodules https://github.com/khcrysalis/Zsign-Package.git Zsign-Package
+        # التعديل الأول: تحديد الفرع package
+        run: git clone --depth 1 --branch package --recurse-submodules https://github.com/khcrysalis/Zsign-Package.git Zsign-Package
 
       - name: Dump Zsign API (send me this part of the log if the build fails)
         run: |
@@ -549,10 +550,9 @@ jobs:
                   TARGETED_DEVICE_FAMILY: "1,2"
           EOF
 
-          # Detect the library product name from the package manifest
-          PRODUCT=$(perl -0ne 'print $1 if /\.library\(\s*name:\s*"([^"]+)"/s' Zsign-Package/Package.swift)
-          echo "Detected Zsign product: $PRODUCT"
-          [ -n "$PRODUCT" ] || PRODUCT=Zsign
+          # التعديل الثاني: تثبيت اسم المنتج لتجنب اختيار zsignc بالخطأ
+          PRODUCT=Zsign
+          echo "Using Zsign product: $PRODUCT"
           perl -pi -e "s/__ZSIGN_PRODUCT__/$PRODUCT/g" project.yml Sources/Signer.swift
           perl -pi -e "s/__BUNDLE_ID__/$BUNDLE_ID/g" project.yml
           xcodegen generate
